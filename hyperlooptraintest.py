@@ -5,6 +5,7 @@ hyperlooptraintest.py - Download and run an AliHyperloop train test locally via 
 Usage:
     python hyperlooptraintest.py <url>
     python hyperlooptraintest.py https://alimonitor.cern.ch/train-workdir/tests/0063/00632029/
+    python hyperlooptraintest.py <url> --local --package O2Physics
 """
 
 import sys
@@ -54,6 +55,7 @@ import requests
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.prompt import IntPrompt, Prompt
 from rich.table import Table
 from rich.text import Text
 
@@ -67,6 +69,9 @@ SIF_IMAGE = "docker://alisw/slc9-builder:latest"
 # Marker lines in stdout.log
 _RUN_CMD_TRIGGER = "you can achieve this with the following reduced command line:"
 _ALIEN_PATHS_TRIGGER = "The corresponding AliEn paths are"
+
+# Known alienv binary locations (tried in order)
+_ALIENV_CANDIDATES = ["alienv", "/cvmfs/alice.cern.ch/bin/alienv"]
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +139,98 @@ def extract_alien_paths(stdout_log: Path) -> List[str]:
     return paths
 
 
+def _run_alienv(args: List[str], timeout: int = 30) -> subprocess.CompletedProcess:
+    """Try alienv candidates in order, return first successful result."""
+    last_exc: Optional[Exception] = None
+    for candidate in _ALIENV_CANDIDATES:
+        try:
+            return subprocess.run(
+                [candidate] + args,
+                capture_output=True, text=True, check=False, timeout=timeout,
+            )
+        except FileNotFoundError as exc:
+            last_exc = exc
+    raise FileNotFoundError(
+        f"alienv not found. Tried: {_ALIENV_CANDIDATES}. "
+        "Is CVMFS mounted at /cvmfs/alice.cern.ch?"
+    ) from last_exc
+
+
+def list_alienv_packages(package: str) -> List[str]:
+    """Run alienv list and return lines matching *package*."""
+    result = _run_alienv(["q"], timeout=60)
+    lines = (result.stdout + result.stderr).splitlines()
+    return [l.strip() for l in lines if package in l and l.strip()]
+
+
+def select_package_interactive(package: str) -> str:
+    """
+    Show all alienv tags matching *package*, with <L> (latest) first.
+    Prompts the user to pick one and returns the clean tag string
+    (without the ' <L>' suffix).
+    """
+    console.print(
+        f"\n[bold]Querying alienv for packages matching [cyan]{package}[/cyan] …[/bold]"
+    )
+    tags = list_alienv_packages(package)
+    if not tags:
+        console.print(f"\n[bold red]✗ No packages matching '{package}' found via alienv.[/bold red]")
+        sys.exit(1)
+
+    # Sort: <L> (latest) entries first, then alphabetically
+    latest_tags = sorted([t for t in tags if "<L>" in t])
+    other_tags = sorted([t for t in tags if "<L>" not in t])
+    sorted_tags = latest_tags + other_tags
+
+    table = Table(show_header=True, header_style="bold magenta", box=None, padding=(0, 1))
+    table.add_column("#", style="bold white", width=4, justify="right")
+    table.add_column("Package Tag", style="cyan")
+    table.add_column("", width=10)
+
+    for i, tag in enumerate(sorted_tags, 1):
+        clean = tag.replace(" <L>", "").strip()
+        note = "[bold green]◄ latest[/bold green]" if "<L>" in tag else ""
+        table.add_row(str(i), clean, note)
+
+    console.print(table)
+
+    idx = IntPrompt.ask(
+        f"\nSelect package [1-{len(sorted_tags)}]",
+        console=console,
+    )
+    if not 1 <= idx <= len(sorted_tags):
+        console.print("[red]Invalid selection.[/red]")
+        sys.exit(1)
+
+    selected = sorted_tags[idx - 1]
+    clean_tag = selected.replace(" <L>", "").strip()
+    console.print(f"\n[green]✓[/green] Selected: [cyan]{clean_tag}[/cyan]")
+    return clean_tag
+
+
+def generate_local_env_sh(package_tag: str, work_dir: Path) -> Path:
+    """
+    Run `alienv printenv <package_tag>` and write the output to env.sh
+    inside *work_dir*.  Returns the path to the written file.
+    """
+    console.print(
+        f"\n[bold]Generating env.sh via [cyan]alienv printenv {package_tag}[/cyan] …[/bold]"
+    )
+    result = _run_alienv(["printenv", package_tag], timeout=60)
+    if result.returncode != 0 or not result.stdout.strip():
+        console.print(
+            f"[bold red]✗ alienv printenv failed (exit {result.returncode}):[/bold red]\n"
+            f"{result.stderr}"
+        )
+        sys.exit(1)
+
+    env_sh = work_dir / "env.sh"
+    env_sh.write_text(result.stdout)
+    env_sh.chmod(0o644)
+    console.print(f"[green]✓[/green] Written [cyan]{env_sh}[/cyan]")
+    return env_sh
+
+
 def ensure_sif() -> None:
     if SIF_PATH.exists():
         console.print(f"  [green]✓[/green] SIF image: [cyan]{SIF_PATH}[/cyan]")
@@ -179,6 +276,25 @@ def run_in_container(work_dir: Path) -> int:
     return result.returncode
 
 
+def run_locally(work_dir: Path) -> int:
+    """Source env.sh and execute run.sh directly on the host (no container)."""
+    shell_cmd = f"cd {work_dir} && source env.sh && bash run.sh"
+
+    console.print(
+        Panel(
+            shell_cmd,
+            title="[bold magenta]Local Execution Command[/bold magenta]",
+            border_style="magenta",
+            padding=(1, 2),
+        )
+    )
+
+    console.rule("[bold magenta]Local Output[/bold magenta]")
+    result = subprocess.run(["bash", "-c", shell_cmd], cwd=str(work_dir))
+    console.rule()
+    return result.returncode
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -196,8 +312,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Download and run an AliHyperloop train test locally.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Example:\n  python hyperlooptraintest.py "
-               "https://alimonitor.cern.ch/train-workdir/tests/0063/00632029/",
+        epilog=(
+            "Examples:\n"
+            "  python hyperlooptraintest.py "
+            "https://alimonitor.cern.ch/train-workdir/tests/0063/00632029/\n"
+            "  python hyperlooptraintest.py <url> --local --package O2Physics"
+        ),
     )
     parser.add_argument(
         "url",
@@ -227,6 +347,22 @@ def main() -> None:
         metavar="FILE",
         help="Path to a local file to use as input_data.txt instead of extracting AliEn paths from stdout.log",
     )
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help=(
+            "Use a locally installed software package (via alienv) instead of "
+            "downloading env.sh from the train-test URL. "
+            "Requires --package (or will prompt if omitted)."
+        ),
+    )
+    parser.add_argument(
+        "--package",
+        default=None,
+        metavar="PKG",
+        help="Package family to search for when --local is set (e.g. O2Physics). "
+             "If omitted, you will be prompted.",
+    )
     args = parser.parse_args()
 
     base_url = normalize_url(args.url)
@@ -234,6 +370,8 @@ def main() -> None:
 
     console.print(f"  [bold]Source URL     :[/bold] {base_url}")
     console.print(f"  [bold]Base dir       :[/bold] {base_dir}")
+    if args.local:
+        console.print(f"  [bold]Env source     :[/bold] [magenta]local (alienv)[/magenta]")
     if args.configuration:
         console.print(f"  [bold]configuration  :[/bold] [yellow]{args.configuration}[/yellow] [dim](override)[/dim]")
     if args.input_data:
@@ -254,7 +392,13 @@ def main() -> None:
     status_table.add_column("Status", justify="center", width=10)
 
     custom_config = Path(args.configuration).resolve() if args.configuration else None
-    files_to_download = [f for f in FILES_TO_DOWNLOAD if not (f == "configuration.json" and custom_config)]
+    # When --local is set, env.sh will be generated locally – skip downloading it
+    skip_files = set()
+    if custom_config:
+        skip_files.add("configuration.json")
+    if args.local:
+        skip_files.add("env.sh")
+    files_to_download = [f for f in FILES_TO_DOWNLOAD if f not in skip_files]
 
     all_ok = True
     with Progress(
@@ -278,6 +422,9 @@ def main() -> None:
             status_table.add_row(fname, url, badge)
             progress.remove_task(task)
 
+    if args.local:
+        status_table.add_row("env.sh", "—", "[magenta]local[/magenta]")
+
     console.print(status_table)
 
     if custom_config:
@@ -293,7 +440,22 @@ def main() -> None:
         )
         sys.exit(1)
 
-    # ── 3. Parse stdout.log ─────────────────────────────────────────────────
+    # ── 3. Generate local env.sh (--local mode) ─────────────────────────────
+    if args.local:
+        package_family = args.package
+        if not package_family:
+            package_family = Prompt.ask(
+                "\nEnter the package family to search for (e.g. [cyan]O2Physics[/cyan])",
+                console=console,
+            ).strip()
+            if not package_family:
+                console.print("[red]No package specified. Aborting.[/red]")
+                sys.exit(1)
+
+        selected_tag = select_package_interactive(package_family)
+        generate_local_env_sh(selected_tag, work_dir)
+
+    # ── 4. Parse stdout.log ─────────────────────────────────────────────────
     stdout_log = work_dir / "stdout.log"
 
     console.print("\n[bold]Extracting run command …[/bold]")
@@ -312,13 +474,13 @@ def main() -> None:
         )
     )
 
-    # ── 4. Write run.sh ─────────────────────────────────────────────────────
+    # ── 5. Write run.sh ─────────────────────────────────────────────────────
     run_sh = work_dir / "run.sh"
     run_sh.write_text(f"#!/bin/bash\nset -e\n\n{run_cmd}\n")
     run_sh.chmod(0o755)
     console.print(f"\n[green]✓[/green] Written [cyan]{run_sh}[/cyan]")
 
-    # ── 5. Write/copy input_data.txt ────────────────────────────────────────
+    # ── 6. Write/copy input_data.txt ────────────────────────────────────────
     input_data = work_dir / "input_data.txt"
     if args.input_data:
         custom_input = Path(args.input_data).resolve()
@@ -341,14 +503,18 @@ def main() -> None:
 
     if args.no_run:
         console.print(
-            "\n[yellow]--no-run flag set. Skipping container execution.[/yellow]"
+            "\n[yellow]--no-run flag set. Skipping execution.[/yellow]"
         )
         console.print(f"\n[bold]Work directory:[/bold] {work_dir}")
         sys.exit(0)
 
-    # ── 6. Run in container ─────────────────────────────────────────────────
-    console.print("\n[bold]Launching apptainer container …[/bold]\n")
-    rc = run_in_container(work_dir)
+    # ── 7. Run (locally or in container) ────────────────────────────────────
+    if args.local:
+        console.print("\n[bold]Running locally (no container) …[/bold]\n")
+        rc = run_locally(work_dir)
+    else:
+        console.print("\n[bold]Launching apptainer container …[/bold]\n")
+        rc = run_in_container(work_dir)
 
     if rc == 0:
         console.print(
@@ -362,7 +528,7 @@ def main() -> None:
     else:
         console.print(
             Panel(
-                f"[bold red]✗ Container exited with code {rc}[/bold red]",
+                f"[bold red]✗ Execution exited with code {rc}[/bold red]",
                 border_style="red",
                 padding=(1, 4),
             )
