@@ -12,6 +12,9 @@ import sys
 import os
 import shutil
 import subprocess
+import re
+import shlex
+from datetime import datetime
 
 # ---------------------------------------------------------------------------
 # Bootstrap: ensure we're running inside a venv with rich + requests installed
@@ -47,7 +50,6 @@ _bootstrap()
 # Main imports (only reached when running inside the venv)
 # ---------------------------------------------------------------------------
 import argparse
-import uuid
 from pathlib import Path
 from typing import List, Optional
 
@@ -65,9 +67,11 @@ FILES_TO_DOWNLOAD = ["stdout.log", "configuration.json", "OutputDirector.json", 
 OPTIONAL_FILES = {"OutputDirector.json"}
 SIF_PATH = Path(SCRIPT_DIR) / "el9.sif"
 SIF_IMAGE = "docker://alisw/slc9-builder:latest"
+DEFAULT_FAIRMQ_SHM_SEGMENT_SIZE = "1073741824"
 
 # Marker lines in stdout.log
 _RUN_CMD_TRIGGER = "you can achieve this with the following reduced command line:"
+_FULL_RUN_CMD_TRIGGER = "The following O2 command will be executed:"
 _ALIEN_PATHS_TRIGGER = "The corresponding AliEn paths are"
 
 # Known alienv binary locations (tried in order)
@@ -91,10 +95,20 @@ def normalize_url(url: str) -> str:
 
 
 def make_work_dir(base: Path) -> Path:
-    uid = uuid.uuid4().hex[:8]
-    d = base / f"traintest_{uid}"
-    d.mkdir(parents=True, exist_ok=False)
-    return d
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    d = base / f"traintest_{ts}"
+    if not d.exists():
+        d.mkdir(parents=True, exist_ok=False)
+        return d
+
+    # If two runs start within the same second, add a small counter suffix.
+    for i in range(1, 100):
+        candidate = base / f"traintest_{ts}_{i:02d}"
+        if not candidate.exists():
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+
+    raise RuntimeError(f"Could not create unique work directory for timestamp {ts}")
 
 
 def download_file(url: str, dest: Path) -> bool:
@@ -111,8 +125,26 @@ def download_file(url: str, dest: Path) -> bool:
 
 
 def extract_run_command(stdout_log: Path) -> Optional[str]:
-    """Return the line immediately after the 'reduced command line' marker."""
+    """Return the train command, preferring the full O2 command when available."""
     lines = stdout_log.read_text(errors="replace").splitlines()
+
+    # Prefer the full train command because it includes global options
+    # (readers, memory limits, shm size, etc.) that the reduced command omits.
+    for i, line in enumerate(lines):
+        if _FULL_RUN_CMD_TRIGGER in line:
+            for candidate in lines[i + 1 :]:
+                stripped = candidate.strip()
+                if stripped:
+                    # Remove optional profiling wrapper from train command:
+                    # "... | perf record ... --user-callchains o2-analysis-foo ..."
+                    cleaned = re.sub(
+                        r"\|\s*perf record\b.*?--user-callchains\s+",
+                        "| ",
+                        stripped,
+                    )
+                    return cleaned
+
+    # Fallback to reduced local command if full command marker is absent.
     for i, line in enumerate(lines):
         if _RUN_CMD_TRIGGER in line:
             for candidate in lines[i + 1 :]:
@@ -295,6 +327,63 @@ def run_locally(work_dir: Path) -> int:
     return result.returncode
 
 
+def submit_sbatch(work_dir: Path, local: bool) -> int:
+    """Submit the prepared run as an sbatch job and return sbatch exit code."""
+    if shutil.which("sbatch") is None:
+        console.print("[bold red]✗ sbatch not found in PATH.[/bold red]")
+        return 1
+
+    if not local:
+        ensure_sif()
+
+    work_dir_q = shlex.quote(str(work_dir))
+    sif_path_q = shlex.quote(str(SIF_PATH))
+    if local:
+        run_line = f"cd {work_dir_q} && source env.sh && bash run.sh"
+    else:
+        run_line = (
+            "apptainer exec "
+            "--bind /cvmfs:/cvmfs "
+            f"--bind {work_dir_q}:/workdir "
+            "--cleanenv "
+            f"{sif_path_q} "
+            "bash -c 'cd /workdir && source env.sh && bash run.sh'"
+        )
+
+    sbatch_script = work_dir / "run.sbatch"
+    sbatch_script.write_text(
+        "#!/bin/bash\n"
+        f"#SBATCH --job-name={work_dir.name}\n"
+        f"#SBATCH --output={work_dir / 'slurm-%j.out'}\n"
+        f"#SBATCH --error={work_dir / 'slurm-%j.err'}\n\n"
+        f"#SBATCH --cpus-per-task=8\n"
+        "set -e\n"
+        f"{run_line}\n"
+    )
+    sbatch_script.chmod(0o755)
+    console.print(f"[green]✓[/green] Written [cyan]{sbatch_script}[/cyan]")
+
+    submit_cmd = ["sbatch", str(sbatch_script)]
+    console.print(
+        Panel(
+            " ".join(shlex.quote(p) for p in submit_cmd),
+            title="[bold blue]sbatch Submit Command[/bold blue]",
+            border_style="blue",
+            padding=(1, 2),
+        )
+    )
+    result = subprocess.run(submit_cmd, cwd=str(work_dir), capture_output=True, text=True)
+    output = (result.stdout or "").strip()
+    error = (result.stderr or "").strip()
+    if output:
+        console.print(output)
+    if result.returncode != 0:
+        if error:
+            console.print(f"[red]{error}[/red]")
+        return result.returncode
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -357,11 +446,26 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--sbatch",
+        action="store_true",
+        help="Submit the execution as an sbatch job instead of running immediately.",
+    )
+    parser.add_argument(
         "--package",
         default=None,
         metavar="PKG",
         help="Package family to search for when --local is set (e.g. O2Physics). "
              "If omitted, you will be prompted.",
+    )
+    parser.add_argument(
+        "--aod-memory-rate-limit-mb",
+        type=int,
+        default=None,
+        metavar="MB",
+        help=(
+            "Override --aod-memory-rate-limit in the run command. "
+            "Value is specified in MB and converted to bytes."
+        ),
     )
     args = parser.parse_args()
 
@@ -372,10 +476,16 @@ def main() -> None:
     console.print(f"  [bold]Base dir       :[/bold] {base_dir}")
     if args.local:
         console.print(f"  [bold]Env source     :[/bold] [magenta]local (alienv)[/magenta]")
+    if args.sbatch:
+        console.print("  [bold]Execution mode :[/bold] [blue]sbatch[/blue]")
     if args.configuration:
         console.print(f"  [bold]configuration  :[/bold] [yellow]{args.configuration}[/yellow] [dim](override)[/dim]")
     if args.input_data:
         console.print(f"  [bold]input_data.txt :[/bold] [yellow]{args.input_data}[/yellow] [dim](override)[/dim]")
+    if args.aod_memory_rate_limit_mb is not None:
+        console.print(
+            f"  [bold]AOD mem limit  :[/bold] [yellow]{args.aod_memory_rate_limit_mb} MB[/yellow] [dim](override)[/dim]"
+        )
 
     # ── 1. Create work directory ────────────────────────────────────────────
     console.rule()
@@ -465,6 +575,24 @@ def main() -> None:
             "[bold red]✗ Could not locate the reduced run command in stdout.log.[/bold red]"
         )
         sys.exit(1)
+
+    # Remove train time limit so local runs are not forcibly stopped.
+    run_cmd = re.sub(r"\s*--time-limit(?:\s+|=)\S+", "", run_cmd).strip()
+
+    if args.aod_memory_rate_limit_mb is not None:
+        if args.aod_memory_rate_limit_mb <= 0:
+            console.print("[bold red]✗ --aod-memory-rate-limit-mb must be > 0[/bold red]")
+            sys.exit(1)
+        aod_limit_bytes = args.aod_memory_rate_limit_mb * 1_000_000
+        if "--aod-memory-rate-limit" in run_cmd:
+            run_cmd = re.sub(
+                r"--aod-memory-rate-limit\s+\S+",
+                f"--aod-memory-rate-limit {aod_limit_bytes}",
+                run_cmd,
+            )
+        else:
+            run_cmd = f"{run_cmd} --aod-memory-rate-limit {aod_limit_bytes}"
+
     console.print(
         Panel(
             Text(run_cmd, overflow="fold"),
@@ -475,8 +603,17 @@ def main() -> None:
     )
 
     # ── 5. Write run.sh ─────────────────────────────────────────────────────
+    if "--shm-segment-size" not in run_cmd:
+        run_cmd = f"{run_cmd} --shm-segment-size $FAIRMQ_SHM_SEGMENT_SIZE"
+
     run_sh = work_dir / "run.sh"
-    run_sh.write_text(f"#!/bin/bash\nset -e\n\n{run_cmd}\n")
+    run_sh.write_text(
+        "#!/bin/bash\n"
+        "set -e\n\n"
+        'export FAIRMQ_IPC_PREFIX="${FAIRMQ_IPC_PREFIX:-/tmp/fmq_${USER}_$$}"\n'
+        f'export FAIRMQ_SHM_SEGMENT_SIZE="${{FAIRMQ_SHM_SEGMENT_SIZE:-{DEFAULT_FAIRMQ_SHM_SEGMENT_SIZE}}}"\n\n'
+        f"{run_cmd}\n"
+    )
     run_sh.chmod(0o755)
     console.print(f"\n[green]✓[/green] Written [cyan]{run_sh}[/cyan]")
 
@@ -509,7 +646,10 @@ def main() -> None:
         sys.exit(0)
 
     # ── 7. Run (locally or in container) ────────────────────────────────────
-    if args.local:
+    if args.sbatch:
+        console.print("\n[bold]Submitting sbatch job …[/bold]\n")
+        rc = submit_sbatch(work_dir, local=args.local)
+    elif args.local:
         console.print("\n[bold]Running locally (no container) …[/bold]\n")
         rc = run_locally(work_dir)
     else:
@@ -517,9 +657,12 @@ def main() -> None:
         rc = run_in_container(work_dir)
 
     if rc == 0:
+        success_msg = "[bold green]✓ Workflow completed successfully![/bold green]"
+        if args.sbatch:
+            success_msg = "[bold green]✓ sbatch job submitted successfully![/bold green]"
         console.print(
             Panel(
-                f"[bold green]✓ Workflow completed successfully![/bold green]\n"
+                f"{success_msg}\n"
                 f"Work directory: [cyan]{work_dir}[/cyan]",
                 border_style="green",
                 padding=(1, 4),

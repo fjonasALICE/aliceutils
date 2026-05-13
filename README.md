@@ -28,6 +28,14 @@ python hyperlooptraintest.py \
   --local --package O2Physics
 ```
 
+**Submit as a Slurm job** (instead of running immediately):
+
+```bash
+python hyperlooptraintest.py \
+  https://alimonitor.cern.ch/train-workdir/tests/0063/00632029/ \
+  --sbatch
+```
+
 **Help**
 ```bash
 python hyperlooptraintest.py --help
@@ -45,7 +53,7 @@ Given a train-test URL, the script:
    `OutputDirector.json` is optional)
 3. extracts the reduced run command from `stdout.log` and writes it to `run.sh`
 4. extracts AliEn input paths into `input_data.txt` (or uses your override file)
-5. executes `env.sh` + `run.sh`
+5. executes `env.sh` + `run.sh`, or submits them via `sbatch` with `--sbatch`
 
 ### Prerequisites
 
@@ -53,6 +61,7 @@ Given a train-test URL, the script:
 - `apptainer` in `PATH` and access to `/cvmfs` — **only required without `--local`**  
   (the container run binds `/cvmfs:/cvmfs`)
 - `alienv` available — **only required with `--local`**
+- `sbatch` available — **only required with `--sbatch`**
 
 ### Using a local software package (`--local`)
 
@@ -72,6 +81,7 @@ If `--package` is omitted you will be prompted to enter the package family at ru
 | Flag | Description |
 |---|---|
 | `--local` | Generate `env.sh` from a locally installed package via `alienv` instead of downloading it. |
+| `--sbatch` | Submit the prepared execution as a Slurm job (`sbatch`) instead of running it immediately. |
 | `--package PKG` | Package family to search for with `--local` (e.g. `O2Physics`). Prompted if omitted. |
 | `--no-run` | Prepare files only, skip execution. |
 | `--workdir DIR` | Base directory where the `traintest_<id>` folder is created (default: current directory). |
@@ -82,3 +92,4 @@ If `--package` is omitted you will be prompted to enter the package family at ru
 
 - The script normalizes the URL and switches `https://alimonitor.cern.ch/...` to `http://...`
 - Each run creates a new timestamped working folder; existing folders are never overwritten.
+- With `--sbatch`, the script writes `run.sbatch` in the work directory and submits it.
