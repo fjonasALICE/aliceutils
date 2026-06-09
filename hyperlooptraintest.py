@@ -3,9 +3,10 @@
 hyperlooptraintest.py - Download and run an AliHyperloop train test locally via apptainer.
 
 Usage:
-    python hyperlooptraintest.py <url>
+    python hyperlooptraintest.py <url-or-workdir>
     python hyperlooptraintest.py https://alimonitor.cern.ch/train-workdir/tests/0063/00632029/
     python hyperlooptraintest.py <url> --local --package O2Physics
+    python hyperlooptraintest.py /path/to/traintest_YYYYMMDD_HHMMSS
 """
 
 import sys
@@ -73,6 +74,7 @@ DEFAULT_FAIRMQ_SHM_SEGMENT_SIZE = "1073741824"
 _RUN_CMD_TRIGGER = "you can achieve this with the following reduced command line:"
 _FULL_RUN_CMD_TRIGGER = "The following O2 command will be executed:"
 _ALIEN_PATHS_TRIGGER = "The corresponding AliEn paths are"
+_DEFAULT_PARENT_BASE_LOCAL = "/home/alitrain/train-workdir/testdata/LFN"
 
 # Known alienv binary locations (tried in order)
 _ALIENV_CANDIDATES = ["alienv", "/cvmfs/alice.cern.ch/bin/alienv"]
@@ -92,6 +94,11 @@ def normalize_url(url: str) -> str:
             "  [yellow]Note: alimonitor.cern.ch uses plain HTTP – switched https→http[/yellow]"
         )
     return url
+
+
+def is_url_source(source: str) -> bool:
+    """Best-effort check whether *source* is an HTTP(S) URL."""
+    return source.startswith("http://") or source.startswith("https://")
 
 
 def make_work_dir(base: Path) -> Path:
@@ -169,6 +176,39 @@ def extract_alien_paths(stdout_log: Path) -> List[str]:
                 break
             paths.append(stripped)
     return paths
+
+
+def load_input_paths(path: Path) -> List[str]:
+    """Load non-empty, stripped input path lines from a file."""
+    lines = path.read_text(errors="replace").splitlines()
+    return [line.strip() for line in lines if line.strip()]
+
+
+def configure_parent_access_for_derived(run_cmd: str) -> str:
+    """
+    For derived AO2Ds, make parent lookup use AliEn paths instead of local LFN staging.
+    """
+    reverse_replacement = f'"{_DEFAULT_PARENT_BASE_LOCAL};alien://"'
+
+    if "--aod-parent-access-level" in run_cmd:
+        run_cmd = re.sub(
+            r"--aod-parent-access-level\s+\S+",
+            "--aod-parent-access-level 1",
+            run_cmd,
+        )
+    else:
+        run_cmd = f"{run_cmd} --aod-parent-access-level 1"
+
+    if "--aod-parent-base-path-replacement" in run_cmd:
+        run_cmd = re.sub(
+            r'--aod-parent-base-path-replacement\s+(?:"[^"]*"|\S+)',
+            f"--aod-parent-base-path-replacement {reverse_replacement}",
+            run_cmd,
+        )
+    else:
+        run_cmd = f"{run_cmd} --aod-parent-base-path-replacement {reverse_replacement}"
+
+    return run_cmd
 
 
 def _run_alienv(args: List[str], timeout: int = 30) -> subprocess.CompletedProcess:
@@ -405,17 +445,18 @@ def main() -> None:
             "Examples:\n"
             "  python hyperlooptraintest.py "
             "https://alimonitor.cern.ch/train-workdir/tests/0063/00632029/\n"
-            "  python hyperlooptraintest.py <url> --local --package O2Physics"
+            "  python hyperlooptraintest.py <url> --local --package O2Physics\n"
+            "  python hyperlooptraintest.py /path/to/traintest_YYYYMMDD_HHMMSS"
         ),
     )
     parser.add_argument(
-        "url",
-        help="URL to the train-test directory on alimonitor",
+        "source",
+        help="Train-test URL on alimonitor OR path to an existing local traintest directory",
     )
     parser.add_argument(
         "--no-run",
         action="store_true",
-        help="Download and prepare files only; skip the container execution",
+        help="Skip execution (still prepares files when source is a URL).",
     )
     parser.add_argument(
         "--workdir",
@@ -442,7 +483,8 @@ def main() -> None:
         help=(
             "Use a locally installed software package (via alienv) instead of "
             "downloading env.sh from the train-test URL. "
-            "Requires --package (or will prompt if omitted)."
+            "Requires --package (or will prompt if omitted). "
+            "With a local directory source, this runs in the local shell."
         ),
     )
     parser.add_argument(
@@ -467,176 +509,246 @@ def main() -> None:
             "Value is specified in MB and converted to bytes."
         ),
     )
+    parser.add_argument(
+        "--derived",
+        action="store_true",
+        help=(
+            "Force derived-input mode: keep parent lookup enabled and resolve parent files via AliEn."
+        ),
+    )
     args = parser.parse_args()
 
-    base_url = normalize_url(args.url)
-    base_dir = Path(args.workdir).resolve() if args.workdir else Path.cwd()
+    source_raw = args.source.strip()
+    source_path = Path(source_raw).expanduser()
+    source_is_url = is_url_source(source_raw)
+    source_is_dir = source_path.is_dir()
 
-    console.print(f"  [bold]Source URL     :[/bold] {base_url}")
-    console.print(f"  [bold]Base dir       :[/bold] {base_dir}")
-    if args.local:
-        console.print(f"  [bold]Env source     :[/bold] [magenta]local (alienv)[/magenta]")
-    if args.sbatch:
-        console.print("  [bold]Execution mode :[/bold] [blue]sbatch[/blue]")
-    if args.configuration:
-        console.print(f"  [bold]configuration  :[/bold] [yellow]{args.configuration}[/yellow] [dim](override)[/dim]")
-    if args.input_data:
-        console.print(f"  [bold]input_data.txt :[/bold] [yellow]{args.input_data}[/yellow] [dim](override)[/dim]")
-    if args.aod_memory_rate_limit_mb is not None:
+    if not source_is_url and not source_is_dir:
         console.print(
-            f"  [bold]AOD mem limit  :[/bold] [yellow]{args.aod_memory_rate_limit_mb} MB[/yellow] [dim](override)[/dim]"
+            "[bold red]✗ Source must be either an HTTP(S) URL or an existing directory.[/bold red]"
         )
-
-    # ── 1. Create work directory ────────────────────────────────────────────
-    console.rule()
-    work_dir = make_work_dir(base_dir)
-    console.print(
-        f"\n[bold green]✓ Work directory created:[/bold green] [cyan]{work_dir}[/cyan]\n"
-    )
-
-    # ── 2. Download files ───────────────────────────────────────────────────
-    console.print("[bold]Downloading files …[/bold]\n")
-    status_table = Table(show_header=True, header_style="bold magenta", box=None)
-    status_table.add_column("File", style="cyan", width=30)
-    status_table.add_column("URL")
-    status_table.add_column("Status", justify="center", width=10)
-
-    custom_config = Path(args.configuration).resolve() if args.configuration else None
-    # When --local is set, env.sh will be generated locally – skip downloading it
-    skip_files = set()
-    if custom_config:
-        skip_files.add("configuration.json")
-    if args.local:
-        skip_files.add("env.sh")
-    files_to_download = [f for f in FILES_TO_DOWNLOAD if f not in skip_files]
-
-    all_ok = True
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        transient=True,
-        console=console,
-    ) as progress:
-        for fname in files_to_download:
-            task = progress.add_task(f"  {fname}", total=None)
-            url = base_url + fname
-            dest = work_dir / fname
-            ok = download_file(url, dest)
-            if ok:
-                badge = "[green]✓ OK[/green]"
-            elif fname in OPTIONAL_FILES:
-                badge = "[yellow]– skipped[/yellow]"
-            else:
-                badge = "[red]✗ FAILED[/red]"
-                all_ok = False
-            status_table.add_row(fname, url, badge)
-            progress.remove_task(task)
-
-    if args.local:
-        status_table.add_row("env.sh", "—", "[magenta]local[/magenta]")
-
-    console.print(status_table)
-
-    if custom_config:
-        shutil.copy2(custom_config, work_dir / "configuration.json")
-        console.print(
-            f"[green]✓[/green] Copied custom configuration: "
-            f"[cyan]{custom_config}[/cyan] → [cyan]{work_dir / 'configuration.json'}[/cyan]"
-        )
-
-    if not all_ok:
-        console.print(
-            "\n[bold red]✗ One or more downloads failed. Aborting.[/bold red]"
-        )
+        console.print(f"[dim]Given:[/dim] {source_raw}")
         sys.exit(1)
 
-    # ── 3. Generate local env.sh (--local mode) ─────────────────────────────
-    if args.local:
-        package_family = args.package
-        if not package_family:
-            package_family = Prompt.ask(
-                "\nEnter the package family to search for (e.g. [cyan]O2Physics[/cyan])",
-                console=console,
-            ).strip()
-            if not package_family:
-                console.print("[red]No package specified. Aborting.[/red]")
-                sys.exit(1)
+    if source_is_url:
+        base_url = normalize_url(source_raw)
+        base_dir = Path(args.workdir).resolve() if args.workdir else Path.cwd()
 
-        selected_tag = select_package_interactive(package_family)
-        generate_local_env_sh(selected_tag, work_dir)
+        console.print(f"  [bold]Source type    :[/bold] [cyan]URL[/cyan]")
+        console.print(f"  [bold]Source URL     :[/bold] {base_url}")
+        console.print(f"  [bold]Base dir       :[/bold] {base_dir}")
+        if args.local:
+            console.print(f"  [bold]Env source     :[/bold] [magenta]local (alienv)[/magenta]")
+        if args.sbatch:
+            console.print("  [bold]Execution mode :[/bold] [blue]sbatch[/blue]")
+        if args.configuration:
+            console.print(f"  [bold]configuration  :[/bold] [yellow]{args.configuration}[/yellow] [dim](override)[/dim]")
+        if args.input_data:
+            console.print(f"  [bold]input_data.txt :[/bold] [yellow]{args.input_data}[/yellow] [dim](override)[/dim]")
+        if args.aod_memory_rate_limit_mb is not None:
+            console.print(
+                f"  [bold]AOD mem limit  :[/bold] [yellow]{args.aod_memory_rate_limit_mb} MB[/yellow] [dim](override)[/dim]"
+            )
 
-    # ── 4. Parse stdout.log ─────────────────────────────────────────────────
-    stdout_log = work_dir / "stdout.log"
-
-    console.print("\n[bold]Extracting run command …[/bold]")
-    run_cmd = extract_run_command(stdout_log)
-    if not run_cmd:
+        # ── 1. Create work directory ────────────────────────────────────────
+        console.rule()
+        work_dir = make_work_dir(base_dir)
         console.print(
-            "[bold red]✗ Could not locate the reduced run command in stdout.log.[/bold red]"
+            f"\n[bold green]✓ Work directory created:[/bold green] [cyan]{work_dir}[/cyan]\n"
         )
-        sys.exit(1)
 
-    # Remove train time limit so local runs are not forcibly stopped.
-    run_cmd = re.sub(r"\s*--time-limit(?:\s+|=)\S+", "", run_cmd).strip()
+        # ── 2. Download files ───────────────────────────────────────────────
+        console.print("[bold]Downloading files …[/bold]\n")
+        status_table = Table(show_header=True, header_style="bold magenta", box=None)
+        status_table.add_column("File", style="cyan", width=30)
+        status_table.add_column("URL")
+        status_table.add_column("Status", justify="center", width=10)
 
-    if args.aod_memory_rate_limit_mb is not None:
-        if args.aod_memory_rate_limit_mb <= 0:
-            console.print("[bold red]✗ --aod-memory-rate-limit-mb must be > 0[/bold red]")
+        custom_config = Path(args.configuration).resolve() if args.configuration else None
+        # When --local is set, env.sh will be generated locally – skip downloading it
+        skip_files = set()
+        if custom_config:
+            skip_files.add("configuration.json")
+        if args.local:
+            skip_files.add("env.sh")
+        files_to_download = [f for f in FILES_TO_DOWNLOAD if f not in skip_files]
+
+        all_ok = True
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            transient=True,
+            console=console,
+        ) as progress:
+            for fname in files_to_download:
+                task = progress.add_task(f"  {fname}", total=None)
+                url = base_url + fname
+                dest = work_dir / fname
+                ok = download_file(url, dest)
+                if ok:
+                    badge = "[green]✓ OK[/green]"
+                elif fname in OPTIONAL_FILES:
+                    badge = "[yellow]– skipped[/yellow]"
+                else:
+                    badge = "[red]✗ FAILED[/red]"
+                    all_ok = False
+                status_table.add_row(fname, url, badge)
+                progress.remove_task(task)
+
+        if args.local:
+            status_table.add_row("env.sh", "—", "[magenta]local[/magenta]")
+
+        console.print(status_table)
+
+        if custom_config:
+            shutil.copy2(custom_config, work_dir / "configuration.json")
+            console.print(
+                f"[green]✓[/green] Copied custom configuration: "
+                f"[cyan]{custom_config}[/cyan] → [cyan]{work_dir / 'configuration.json'}[/cyan]"
+            )
+
+        if not all_ok:
+            console.print(
+                "\n[bold red]✗ One or more downloads failed. Aborting.[/bold red]"
+            )
             sys.exit(1)
-        aod_limit_bytes = args.aod_memory_rate_limit_mb * 1_000_000
-        if "--aod-memory-rate-limit" in run_cmd:
-            run_cmd = re.sub(
-                r"--aod-memory-rate-limit\s+\S+",
-                f"--aod-memory-rate-limit {aod_limit_bytes}",
-                run_cmd,
+
+        # ── 3. Generate local env.sh (--local mode) ─────────────────────────
+        if args.local:
+            package_family = args.package
+            if not package_family:
+                package_family = Prompt.ask(
+                    "\nEnter the package family to search for (e.g. [cyan]O2Physics[/cyan])",
+                    console=console,
+                ).strip()
+                if not package_family:
+                    console.print("[red]No package specified. Aborting.[/red]")
+                    sys.exit(1)
+
+            selected_tag = select_package_interactive(package_family)
+            generate_local_env_sh(selected_tag, work_dir)
+
+        # ── 4. Parse stdout.log ─────────────────────────────────────────────
+        stdout_log = work_dir / "stdout.log"
+        input_data = work_dir / "input_data.txt"
+        if args.input_data:
+            input_paths = load_input_paths(Path(args.input_data).resolve())
+        else:
+            input_paths = extract_alien_paths(stdout_log)
+        derived_mode = args.derived
+
+        console.print("\n[bold]Extracting run command …[/bold]")
+        run_cmd = extract_run_command(stdout_log)
+        if not run_cmd:
+            console.print(
+                "[bold red]✗ Could not locate the reduced run command in stdout.log.[/bold red]"
+            )
+            sys.exit(1)
+
+        # Remove train time limit so local runs are not forcibly stopped.
+        run_cmd = re.sub(r"\s*--time-limit(?:\s+|=)\S+", "", run_cmd).strip()
+
+        if args.aod_memory_rate_limit_mb is not None:
+            if args.aod_memory_rate_limit_mb <= 0:
+                console.print("[bold red]✗ --aod-memory-rate-limit-mb must be > 0[/bold red]")
+                sys.exit(1)
+            aod_limit_bytes = args.aod_memory_rate_limit_mb * 1_000_000
+            if "--aod-memory-rate-limit" in run_cmd:
+                run_cmd = re.sub(
+                    r"--aod-memory-rate-limit\s+\S+",
+                    f"--aod-memory-rate-limit {aod_limit_bytes}",
+                    run_cmd,
+                )
+            else:
+                run_cmd = f"{run_cmd} --aod-memory-rate-limit {aod_limit_bytes}"
+
+        if derived_mode:
+            run_cmd = configure_parent_access_for_derived(run_cmd)
+            console.print(
+                "  [magenta]Derived mode enabled via --derived "
+                "(parent files will be resolved via AliEn).[/magenta]"
+            )
+
+        console.print(
+            Panel(
+                Text(run_cmd, overflow="fold"),
+                title="[bold green]Run Command[/bold green]",
+                border_style="green",
+                padding=(1, 2),
+            )
+        )
+
+        # ── 5. Write run.sh ─────────────────────────────────────────────────
+        if "--shm-segment-size" not in run_cmd:
+            run_cmd = f"{run_cmd} --shm-segment-size $FAIRMQ_SHM_SEGMENT_SIZE"
+
+        run_sh = work_dir / "run.sh"
+        run_sh.write_text(
+            "#!/bin/bash\n"
+            "set -e\n\n"
+            'export FAIRMQ_IPC_PREFIX="${FAIRMQ_IPC_PREFIX:-/tmp/fmq_${USER}_$$}"\n'
+            f'export FAIRMQ_SHM_SEGMENT_SIZE="${{FAIRMQ_SHM_SEGMENT_SIZE:-{DEFAULT_FAIRMQ_SHM_SEGMENT_SIZE}}}"\n\n'
+            f"{run_cmd}\n"
+        )
+        run_sh.chmod(0o755)
+        console.print(f"\n[green]✓[/green] Written [cyan]{run_sh}[/cyan]")
+
+        # ── 6. Write/copy input_data.txt ────────────────────────────────────
+        if args.input_data:
+            custom_input = Path(args.input_data).resolve()
+            shutil.copy2(custom_input, input_data)
+            console.print(
+                f"[green]✓[/green] Copied custom input data: "
+                f"[cyan]{custom_input}[/cyan] → [cyan]{input_data}[/cyan]"
             )
         else:
-            run_cmd = f"{run_cmd} --aod-memory-rate-limit {aod_limit_bytes}"
-
-    console.print(
-        Panel(
-            Text(run_cmd, overflow="fold"),
-            title="[bold green]Run Command[/bold green]",
-            border_style="green",
-            padding=(1, 2),
-        )
-    )
-
-    # ── 5. Write run.sh ─────────────────────────────────────────────────────
-    if "--shm-segment-size" not in run_cmd:
-        run_cmd = f"{run_cmd} --shm-segment-size $FAIRMQ_SHM_SEGMENT_SIZE"
-
-    run_sh = work_dir / "run.sh"
-    run_sh.write_text(
-        "#!/bin/bash\n"
-        "set -e\n\n"
-        'export FAIRMQ_IPC_PREFIX="${FAIRMQ_IPC_PREFIX:-/tmp/fmq_${USER}_$$}"\n'
-        f'export FAIRMQ_SHM_SEGMENT_SIZE="${{FAIRMQ_SHM_SEGMENT_SIZE:-{DEFAULT_FAIRMQ_SHM_SEGMENT_SIZE}}}"\n\n'
-        f"{run_cmd}\n"
-    )
-    run_sh.chmod(0o755)
-    console.print(f"\n[green]✓[/green] Written [cyan]{run_sh}[/cyan]")
-
-    # ── 6. Write/copy input_data.txt ────────────────────────────────────────
-    input_data = work_dir / "input_data.txt"
-    if args.input_data:
-        custom_input = Path(args.input_data).resolve()
-        shutil.copy2(custom_input, input_data)
-        console.print(
-            f"[green]✓[/green] Copied custom input data: "
-            f"[cyan]{custom_input}[/cyan] → [cyan]{input_data}[/cyan]"
-        )
+            console.print("\n[bold]Extracting AliEn input paths …[/bold]")
+            if not input_paths:
+                console.print("  [yellow]Warning: No AliEn paths found – input_data.txt will be empty.[/yellow]")
+            else:
+                console.print(f"  [green]Found {len(input_paths)} path(s):[/green]")
+                for p in input_paths:
+                    console.print(f"    [cyan]{p}[/cyan]")
+            input_data.write_text("\n".join(input_paths) + ("\n" if input_paths else ""))
+            console.print(f"[green]✓[/green] Written [cyan]{input_data}[/cyan]")
     else:
-        console.print("\n[bold]Extracting AliEn input paths …[/bold]")
-        alien_paths = extract_alien_paths(stdout_log)
-        if not alien_paths:
-            console.print("  [yellow]Warning: No AliEn paths found – input_data.txt will be empty.[/yellow]")
-        else:
-            console.print(f"  [green]Found {len(alien_paths)} path(s):[/green]")
-            for p in alien_paths:
-                console.print(f"    [cyan]{p}[/cyan]")
-        input_data.write_text("\n".join(alien_paths) + ("\n" if alien_paths else ""))
-        console.print(f"[green]✓[/green] Written [cyan]{input_data}[/cyan]")
+        work_dir = source_path.resolve()
+        ignored_flags = []
+        if args.workdir:
+            ignored_flags.append("--workdir")
+        if args.configuration:
+            ignored_flags.append("--configuration")
+        if args.input_data:
+            ignored_flags.append("--input-data")
+        if args.package:
+            ignored_flags.append("--package")
+        if args.aod_memory_rate_limit_mb is not None:
+            ignored_flags.append("--aod-memory-rate-limit-mb")
+
+        console.print(f"  [bold]Source type    :[/bold] [cyan]local directory[/cyan]")
+        console.print(f"  [bold]Work directory :[/bold] [cyan]{work_dir}[/cyan]")
+        if args.local:
+            console.print(f"  [bold]Execution env  :[/bold] [magenta]local shell (--local)[/magenta]")
+        if args.sbatch:
+            console.print("  [bold]Execution mode :[/bold] [blue]sbatch[/blue]")
+        if ignored_flags:
+            console.print(
+                f"  [yellow]Note:[/yellow] Ignoring {', '.join(ignored_flags)} when source is a local directory."
+            )
+        console.print(
+            "\n[bold]Using existing local work directory as-is "
+            "(no download/regeneration).[/bold]"
+        )
+
+    required_for_run = ["env.sh", "run.sh"]
+    missing = [name for name in required_for_run if not (work_dir / name).is_file()]
+    if missing:
+        console.print(
+            "[bold red]✗ Missing required file(s) in work directory: "
+            + ", ".join(missing)
+            + "[/bold red]"
+        )
+        sys.exit(1)
 
     if args.no_run:
         console.print(
