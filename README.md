@@ -110,3 +110,32 @@ If `--package` is omitted you will be prompted to enter the package family at ru
 - Each run creates a new timestamped working folder; existing folders are never overwritten.
 - With `--sbatch`, the script writes `run.sbatch` in the work directory and submits it.
 - Derived-input handling is opt-in: by default behavior is unchanged, and only `--derived` enables parent-path rewriting to fetch parents via AliEn.
+
+## `check_rct_flags.py`
+
+Looks up RCT quality flags in CCDB (`RCT/Flags/RunFlags`) for each reconstruction pass of a run list. Prints a table in the terminal, a summary of how many runs have each flag set, and writes the same report to an HTML file.
+
+Requires the ALICE environment so that `root` is on `PATH`, plus the `rich` package (already installed with the O2 Python modules and in `.venv_hyperloop`).
+
+### Quickstart
+
+```bash
+eval $(alienv -w /home/fjonas/alice/sw --no-refresh printenv O2Physics/latest)
+python3 check_rct_flags.py rct_example_runs.txt
+```
+
+Run numbers can also be passed directly:
+
+```bash
+python3 check_rct_flags.py --runs "535069, 535084"
+```
+
+The run file accepts commas, whitespace, and `#` comments. The latest CCDB version is used for each run and pass. A run counts toward a flag when that flag is set on any pass, including for only part of the run.
+
+### Options
+
+| Flag | Description |
+|---|---|
+| `run_file` | Text file of run numbers. |
+| `--runs` | Comma- or space-separated run numbers. Can be combined with `run_file`. |
+| `--html FILE` | HTML report path (default: `rct_flags.html`). |

@@ -6,6 +6,7 @@ Usage:
     python hyperlooptraintest.py <url-or-workdir>
     python hyperlooptraintest.py https://alimonitor.cern.ch/train-workdir/tests/0063/00632029/
     python hyperlooptraintest.py <url> --local --package O2Physics
+    python hyperlooptraintest.py <url> --output-director /path/to/OutputDirector.json
     python hyperlooptraintest.py /path/to/traintest_YYYYMMDD_HHMMSS
 """
 
@@ -211,6 +212,26 @@ def configure_parent_access_for_derived(run_cmd: str) -> str:
     return run_cmd
 
 
+def enforce_recommended_dpl_options(run_cmd: str) -> str:
+    """Force recommended DPL options in the extracted train command."""
+    recommended_options = {
+        "--readers": "1",
+        "--aod-memory-rate-limit": "2000000000",
+        "--timeframes-rate-limit": "8",
+        "--shm-segment-size": "12000000000",
+    }
+
+    for option, value in recommended_options.items():
+        pattern = rf"(?:^|\s){re.escape(option)}(?:\s+|=)\S+"
+        replacement = f" {option} {value}"
+        if re.search(pattern, run_cmd):
+            run_cmd = re.sub(pattern, replacement, run_cmd)
+        else:
+            run_cmd = f"{run_cmd} {option} {value}"
+
+    return run_cmd.strip()
+
+
 def _run_alienv(args: List[str], timeout: int = 30) -> subprocess.CompletedProcess:
     """Try alienv candidates in order, return first successful result."""
     last_exc: Optional[Exception] = None
@@ -391,12 +412,14 @@ def submit_sbatch(work_dir: Path, local: bool) -> int:
         )
 
     sbatch_script = work_dir / "run.sbatch"
+    # including long partition
     sbatch_script.write_text(
         "#!/bin/bash\n"
         f"#SBATCH --job-name={work_dir.name}\n"
         f"#SBATCH --output={work_dir / 'slurm-%j.out'}\n"
         f"#SBATCH --error={work_dir / 'slurm-%j.err'}\n\n"
         f"#SBATCH --cpus-per-task=8\n"
+        f"#SBATCH --partition=long\n"
         "set -e\n"
         f"{run_line}\n"
     )
@@ -478,6 +501,12 @@ def main() -> None:
         help="Path to a local file to use as input_data.txt instead of extracting AliEn paths from stdout.log",
     )
     parser.add_argument(
+        "--output-director",
+        default=None,
+        metavar="FILE",
+        help="Path to a local OutputDirector.json to use instead of downloading it from the train-test URL",
+    )
+    parser.add_argument(
         "--local",
         action="store_true",
         help=(
@@ -545,6 +574,10 @@ def main() -> None:
             console.print(f"  [bold]configuration  :[/bold] [yellow]{args.configuration}[/yellow] [dim](override)[/dim]")
         if args.input_data:
             console.print(f"  [bold]input_data.txt :[/bold] [yellow]{args.input_data}[/yellow] [dim](override)[/dim]")
+        if args.output_director:
+            console.print(
+                f"  [bold]OutputDirector :[/bold] [yellow]{args.output_director}[/yellow] [dim](override)[/dim]"
+            )
         if args.aod_memory_rate_limit_mb is not None:
             console.print(
                 f"  [bold]AOD mem limit  :[/bold] [yellow]{args.aod_memory_rate_limit_mb} MB[/yellow] [dim](override)[/dim]"
@@ -565,10 +598,15 @@ def main() -> None:
         status_table.add_column("Status", justify="center", width=10)
 
         custom_config = Path(args.configuration).resolve() if args.configuration else None
+        custom_output_director = (
+            Path(args.output_director).resolve() if args.output_director else None
+        )
         # When --local is set, env.sh will be generated locally – skip downloading it
         skip_files = set()
         if custom_config:
             skip_files.add("configuration.json")
+        if custom_output_director:
+            skip_files.add("OutputDirector.json")
         if args.local:
             skip_files.add("env.sh")
         files_to_download = [f for f in FILES_TO_DOWNLOAD if f not in skip_files]
@@ -605,6 +643,12 @@ def main() -> None:
             console.print(
                 f"[green]✓[/green] Copied custom configuration: "
                 f"[cyan]{custom_config}[/cyan] → [cyan]{work_dir / 'configuration.json'}[/cyan]"
+            )
+        if custom_output_director:
+            shutil.copy2(custom_output_director, work_dir / "OutputDirector.json")
+            console.print(
+                f"[green]✓[/green] Copied custom OutputDirector: "
+                f"[cyan]{custom_output_director}[/cyan] → [cyan]{work_dir / 'OutputDirector.json'}[/cyan]"
             )
 
         if not all_ok:
@@ -647,6 +691,7 @@ def main() -> None:
 
         # Remove train time limit so local runs are not forcibly stopped.
         run_cmd = re.sub(r"\s*--time-limit(?:\s+|=)\S+", "", run_cmd).strip()
+        run_cmd = enforce_recommended_dpl_options(run_cmd)
 
         if args.aod_memory_rate_limit_mb is not None:
             if args.aod_memory_rate_limit_mb <= 0:
@@ -720,6 +765,8 @@ def main() -> None:
             ignored_flags.append("--configuration")
         if args.input_data:
             ignored_flags.append("--input-data")
+        if args.output_director:
+            ignored_flags.append("--output-director")
         if args.package:
             ignored_flags.append("--package")
         if args.aod_memory_rate_limit_mb is not None:
