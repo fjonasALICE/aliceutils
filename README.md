@@ -139,3 +139,41 @@ The run file accepts commas, whitespace, and `#` comments. The latest CCDB versi
 | `run_file` | Text file of run numbers. |
 | `--runs` | Comma- or space-separated run numbers. Can be combined with `run_file`. |
 | `--html FILE` | HTML report path (default: `rct_flags.html`). |
+
+## `traincrash.py`
+
+Investigates a failed AliHyperloop train test. It downloads the test logs, then asks an OpenRouter model to explain the crash. The agent can read the published text files, look up the matching sources in [AliceO2Group/O2Physics](https://github.com/AliceO2Group/O2Physics), and, when the log and source are not enough, reproduce the test locally with `hyperlooptraintest.py`.
+
+### Quickstart
+
+Copy the example config and set your OpenRouter key and model:
+
+```bash
+cp traincrash.json.example traincrash.json
+```
+
+`traincrash.json`:
+
+```json
+{
+  "api_key": "sk-or-...",
+  "model": "anthropic/claude-sonnet-4.6"
+}
+```
+
+Then pass the train-test URL:
+
+```bash
+python traincrash.py https://alimonitor.cern.ch/train-workdir/tests/0077/00774559/
+```
+
+The script auto-bootstraps a virtual environment at `.venv_traincrash` and installs `pydantic-ai` and `requests` on first run. `https://alimonitor.cern.ch/...` is switched to `http://...`.
+
+Local reproduction uses `hyperlooptraintest.py` and needs the same prerequisites (`apptainer` and `/cvmfs`).
+
+### Options
+
+| Flag | Description |
+|---|---|
+| `url` | Train-test directory URL on alimonitor. |
+| `--config FILE` | JSON file with `api_key` and `model` (default: `traincrash.json` next to the script). |
