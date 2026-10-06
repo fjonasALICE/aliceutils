@@ -5,6 +5,7 @@ traincrash.py - Explain an AliHyperloop train-test crash with an OpenRouter agen
 Usage:
     python traincrash.py https://alimonitor.cern.ch/train-workdir/tests/0077/00774559/
     python traincrash.py <url> --config /path/to/traincrash.json
+    python traincrash.py <url> --config traincrash.cern.json
 """
 
 import os
@@ -55,7 +56,10 @@ os.environ.setdefault("PYDANTIC_AI_NO_BANNER", "1")
 import requests
 from pydantic_ai import Agent, UsageLimits
 from pydantic_ai.exceptions import ModelHTTPError, UsageLimitExceeded
+from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.models.openrouter import OpenRouterModel
+from pydantic_ai.profiles.openai import OpenAIModelProfile
+from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.providers.openrouter import OpenRouterProvider
 
 MAX_LINES = 200
@@ -434,14 +438,30 @@ def load_config(path: Path) -> dict[str, str]:
         raise SystemExit(f"{path} must contain a non-empty api_key")
     if not isinstance(model, str) or not model.strip():
         raise SystemExit(f"{path} must contain a non-empty model")
-    return {"api_key": key.strip(), "model": model.strip()}
+    cfg = {"api_key": key.strip(), "model": model.strip()}
+    base_url = data.get("base_url")
+    if base_url is not None:
+        if not isinstance(base_url, str) or not base_url.strip():
+            raise SystemExit(f"{path} base_url must be a non-empty string")
+        cfg["base_url"] = base_url.strip().rstrip("/")
+    return cfg
 
 
-def investigate(ctx: Context, cfg: dict[str, str], digest: str) -> str:
-    model = OpenRouterModel(
+def build_model(cfg: dict[str, str]):
+    if cfg.get("base_url"):
+        return OpenAIChatModel(
+            cfg["model"],
+            provider=OpenAIProvider(base_url=cfg["base_url"], api_key=cfg["api_key"]),
+            profile=OpenAIModelProfile(openai_supports_strict_tool_definition=False),
+        )
+    return OpenRouterModel(
         cfg["model"],
         provider=OpenRouterProvider(api_key=cfg["api_key"]),
     )
+
+
+def investigate(ctx: Context, cfg: dict[str, str], digest: str) -> str:
+    model = build_model(cfg)
     agent = Agent(model, instructions=INSTRUCTIONS)
 
     @agent.tool_plain
@@ -494,7 +514,7 @@ def main() -> None:
         "--config",
         default=None,
         metavar="FILE",
-        help="JSON file with api_key and model (default: traincrash.json next to this script)",
+        help="JSON file with api_key, model, and optional base_url (default: traincrash.json next to this script)",
     )
     args = parser.parse_args()
 
@@ -505,7 +525,8 @@ def main() -> None:
         )
     cfg = load_config(cfg_path)
     ctx = Context(normalize_url(args.url))
-    print(f"Investigating {ctx.url} with {cfg['model']} …")
+    via = cfg.get("base_url", "OpenRouter")
+    print(f"Investigating {ctx.url} with {cfg['model']} via {via} …")
     digest = build_digest(ctx)
     try:
         print(investigate(ctx, cfg, digest))
@@ -513,7 +534,7 @@ def main() -> None:
         detail = exc.body.get("message") if isinstance(exc.body, dict) else None
         detail = detail or exc.message
         hint = f" Try {exc.suggested_model_id!r}." if exc.suggested_model_id else ""
-        raise SystemExit(f"OpenRouter rejected {cfg['model']}: {detail}.{hint}") from None
+        raise SystemExit(f"{via} rejected {cfg['model']}: {detail}.{hint}") from None
     except UsageLimitExceeded as exc:
         raise SystemExit(str(exc)) from None
 

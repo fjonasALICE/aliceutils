@@ -1,0 +1,5 @@
+{
+  "api_key": "<CERN AI gateway API key>",
+  "model": "Kimi-K3-FLATIRON",
+  "base_url": "https://aigw.cern.ch/v1"
+}
