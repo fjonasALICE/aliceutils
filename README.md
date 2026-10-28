@@ -177,3 +177,50 @@ Local reproduction uses `hyperlooptraintest.py` and needs the same prerequisites
 |---|---|
 | `url` | Train-test directory URL on alimonitor. |
 | `--config FILE` | JSON file with `api_key` and `model` (default: `traincrash.json` next to the script). |
+
+## `alicemeetingassistant.py`
+
+Answers questions about ALICE meetings on [Indico](https://indico.cern.ch) with an AI agent, for example "What's going on in the ALICE Physics Forum?" or "What did the last PWG-HF meeting discuss?". The agent reads Indico through its HTTP export API (`/export/categ/…`, `/export/event/…`). It lists the meetings in a category and its subcategories, gives a breakdown of the contributions with links to the slides, and reads the slides (PDF or PPTX) when the question is about their content. It can also find every contribution of one collaborator, either in one meeting or across a date range.
+
+By default it searches the whole **ALICE Meetings** category (`6746`), including all subcategories (Physics Forum, PWGs, PAGs, detectors, …).
+
+### Quickstart
+
+Copy the example config. Set the LLM key and model (OpenRouter, or the CERN AI gateway with `base_url`), plus an Indico token:
+
+```bash
+cp alicemeetingassistant.json.example alicemeetingassistant.json
+```
+
+```json
+{
+  "api_key": "<OpenRouter or CERN AI gateway API key>",
+  "model": "Kimi-K3-FLATIRON",
+  "base_url": "https://aigw.cern.ch/v1",
+  "indico_token": "indp_..."
+}
+```
+
+Most ALICE categories are protected, so without a token only public meetings are visible. To create a token, go to Indico → *My profile* → *Personal Tokens*. Give it the scopes **Classic API (read only)** (`read:legacy_api`) and **Everything (only GET)** (`read:everything`). The second scope is needed to download slides. The token can also be set with the `INDICO_TOKEN` environment variable.
+
+```bash
+python alicemeetingassistant.py "What's going on in the ALICE Physics Forum?"
+python alicemeetingassistant.py "Summarise the slides of the last PWG-LF meeting"
+python alicemeetingassistant.py "All contributions of Jane Doe in https://indico.cern.ch/event/1234567/"
+python alicemeetingassistant.py                 # interactive chat
+```
+
+Without a question, the script opens an interactive chat in the terminal. Answers stream in as rendered Markdown, each Indico call is shown while it runs, and follow-up questions keep the context ("now summarise the second talk"). Commands: `/multiline`, `/cp` (copy the last answer), `/usage`, `/exit`. Input history is kept across sessions.
+
+If a group name has no exact match on Indico, the agent uses the closest proxy (acronyms, abbreviations, reordered words, e.g. "Nuclei, Exotica and Spectra PAG" → "NuSpEx PAG") and says which one it used.
+
+The script auto-bootstraps a virtual environment at `.venv_alicemeetingassistant` and installs `pydantic-ai`, `requests`, `pypdf` and `python-pptx` on first run.
+
+### Options
+
+| Flag | Description |
+|---|---|
+| `question` | Question about ALICE meetings. Omit it to open the chat. |
+| `--config FILE` | JSON file with `api_key`, `model`, optional `base_url` and `indico_token` (default: `alicemeetingassistant.json` next to the script). |
+| `--category ID` | Default Indico category to search (default: `6746`, ALICE Meetings). |
+| `--chat` | After answering `question`, continue in the chat with the same context. |
